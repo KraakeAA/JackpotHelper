@@ -14,6 +14,11 @@ const POLLING_INTERVAL_MS = process.env.HELPER_DEJ_DB_POLL_INTERVAL_MS ? parseIn
 const MAX_SESSIONS_PER_CYCLE = process.env.HELPER_DEJ_MAX_SESSIONS_PER_CYCLE ? parseInt(process.env.HELPER_DEJ_MAX_SESSIONS_PER_CYCLE, 10) : 1;
 const JACKPOT_RUN_TURN_TIMEOUT_MS = process.env.HELPER_DEJ_TURN_TIMEOUT_MS ? parseInt(process.env.HELPER_DEJ_TURN_TIMEOUT_MS, 10) : 45000;
 
+const PRICE_FETCH_RETRIES = process.env.HELPER_DEJ_PRICE_FETCH_RETRIES ? parseInt(process.env.HELPER_DEJ_PRICE_FETCH_RETRIES, 10) : 3;
+const PRICE_FETCH_INITIAL_DELAY_MS = process.env.HELPER_DEJ_PRICE_FETCH_INITIAL_DELAY_MS ? parseInt(process.env.HELPER_DEJ_PRICE_FETCH_INITIAL_DELAY_MS, 10) : 2000; // 2 seconds
+const PRICE_FETCH_MAX_DELAY_MS = process.env.HELPER_DEJ_PRICE_FETCH_MAX_DELAY_MS ? parseInt(process.env.HELPER_DEJ_PRICE_FETCH_MAX_DELAY_MS, 10) : 30000; // 30 seconds
+
+
 if (!HELPER_DE_JACKPOT_BOT_TOKEN) {
     console.error("FATAL ERROR: HELPER_DE_JACKPOT_BOT_TOKEN is not defined for the HelperDEJackpot Bot.");
     process.exit(1);
@@ -26,6 +31,9 @@ console.log(`HelperDEJackpot: Token loaded.`);
 console.log(`HelperDEJackpot: DB Polling Interval: ${POLLING_INTERVAL_MS}ms`);
 console.log(`HelperDEJackpot: Max Sessions Per Cycle: ${MAX_SESSIONS_PER_CYCLE}`);
 console.log(`HelperDEJackpot: Turn Timeout for Jackpot Roll: ${JACKPOT_RUN_TURN_TIMEOUT_MS}ms`);
+console.log(`HelperDEJackpot: Price Fetch Retries: ${PRICE_FETCH_RETRIES}`);
+console.log(`HelperDEJackpot: Price Fetch Initial Delay: ${PRICE_FETCH_INITIAL_DELAY_MS}ms`);
+console.log(`HelperDEJackpot: Price Fetch Max Delay: ${PRICE_FETCH_MAX_DELAY_MS}ms`);
 
 // --- Constants and Price Utilities for Helper Bot ---
 const LAMPORTS_PER_SOL = 1000000000;
@@ -43,32 +51,76 @@ const HELPER_SOL_USD_PRICE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
 async function fetchSolUsdPriceFromAPIForHelper() {
     const apiUrl = SOL_PRICE_API_URL_HELPER;
     const logPrefix = '[HelperDEJackpot_PriceFeed]';
+
     if (!apiUrl) {
         console.error(`${logPrefix} API URL is not configured.`);
         throw new Error('Price API URL not configured for helper.');
     }
-    // console.log(`${logPrefix} Fetching SOL/USD price from ${apiUrl}...`); // Can be verbose
-    try {
-        const response = await axios.get(apiUrl, { timeout: 6000 });
-        if (response.data && response.data.solana && typeof response.data.solana.usd === 'number') {
-            const price = parseFloat(response.data.solana.usd);
-            if (isNaN(price) || price <= 0) {
-                throw new Error('Invalid or non-positive price data from API.');
+
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= PRICE_FETCH_RETRIES + 1; attempt++) { // +1 because first attempt is not a "retry"
+        try {
+            if (attempt > 1) {
+                console.log(`${logPrefix} Attempt ${attempt}/${PRICE_FETCH_RETRIES + 1} to fetch SOL/USD price...`);
+            } else {
+                // console.log(`${logPrefix} Fetching SOL/USD price from ${apiUrl}...`); // Can be verbose for first attempt
             }
-            // console.log(`${logPrefix} Fetched price: $${price}`); // Can be verbose
-            return price;
-        } else {
-            console.error(`${logPrefix} ⚠️ SOL price not found or invalid structure in API response:`, response.data);
-            throw new Error('SOL price not found or invalid structure in API response for helper.');
+            const response = await axios.get(apiUrl, { timeout: 10000 }); // Increased timeout slightly for retries
+
+            if (response.data && response.data.solana && typeof response.data.solana.usd === 'number') {
+                const price = parseFloat(response.data.solana.usd);
+                if (isNaN(price) || price <= 0) {
+                    throw new Error('Invalid or non-positive price data from API.');
+                }
+                // console.log(`${logPrefix} Fetched price: $${price}`); // Can be verbose
+                return price; // Success
+            } else {
+                console.error(`${logPrefix} ⚠️ SOL price not found or invalid structure in API response:`, response.data);
+                throw new Error('SOL price not found or invalid structure in API response for helper.');
+            }
+        } catch (error) {
+            lastError = error;
+            const errMsg = error.isAxiosError ? error.message : String(error);
+            const statusCode = error.response ? error.response.status : null;
+
+            console.warn(`${logPrefix} Attempt ${attempt}/${PRICE_FETCH_RETRIES + 1} failed: ${errMsg} (Status: ${statusCode || 'N/A'})`);
+
+            if (attempt <= PRICE_FETCH_RETRIES) {
+                const isRetryableError = statusCode === 429 || // Too Many Requests
+                                         statusCode === null ||   // Network error (no response)
+                                         (statusCode >= 500 && statusCode <= 599); // Server-side errors
+
+                if (isRetryableError) {
+                    let delayMs = PRICE_FETCH_INITIAL_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
+
+                    if (statusCode === 429 && error.response.headers && error.response.headers['retry-after']) {
+                        const retryAfterSeconds = parseInt(error.response.headers['retry-after'], 10);
+                        if (!isNaN(retryAfterSeconds)) {
+                            console.log(`${logPrefix} API suggested Retry-After: ${retryAfterSeconds} seconds.`);
+                            delayMs = (retryAfterSeconds * 1000) + 1000; // Add a small buffer
+                        }
+                    }
+                    
+                    delayMs = Math.min(delayMs, PRICE_FETCH_MAX_DELAY_MS); // Cap the delay
+
+                    console.log(`${logPrefix} Retrying in ${Math.round(delayMs / 1000)}s...`);
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                    continue; // Go to the next attempt
+                } else {
+                    console.error(`${logPrefix} Non-retryable error encountered.`);
+                    break; // Exit retry loop for non-retryable errors
+                }
+            }
         }
-    } catch (error) {
-        const errMsg = error.isAxiosError ? error.message : String(error);
-        console.error(`${logPrefix} ❌ Error fetching SOL/USD price: ${errMsg}`);
-        if (error.response) {
-            console.error(`${logPrefix} API Response Status: ${error.response.status}`);
-        }
-        throw new Error(`Failed to fetch SOL/USD price for helper: ${errMsg}`);
     }
+
+    const finalErrMsg = lastError ? (lastError.isAxiosError ? lastError.message : String(lastError)) : 'Unknown error after all attempts';
+    console.error(`${logPrefix} ❌ Error fetching SOL/USD price after all attempts: ${finalErrMsg}`);
+    if (lastError && lastError.response) {
+        console.error(`${logPrefix} Final API Response Status: ${lastError.response.status}`);
+    }
+    throw new Error(`Failed to fetch SOL/USD price for helper after ${PRICE_FETCH_RETRIES + 1} attempts: ${finalErrMsg}`);
 }
 
 async function getSolUsdPriceForHelper() {
@@ -79,9 +131,7 @@ async function getSolUsdPriceForHelper() {
     }
     if (helperSolPriceCache.isFetching) {
         // console.log(`${logPrefix} Price fetch already in progress. Returning stale if available.`); // Can be verbose
-        // Return stale if available while another fetch is ongoing
         if (helperSolPriceCache.price !== null) return helperSolPriceCache.price;
-        // Or wait a very short time for the ongoing fetch to possibly complete
         await new Promise(resolve => setTimeout(resolve, 750));
         if (helperSolPriceCache.price !== null && (Date.now() - helperSolPriceCache.timestamp < HELPER_SOL_USD_PRICE_CACHE_TTL_MS)) {
              return helperSolPriceCache.price;
@@ -91,7 +141,7 @@ async function getSolUsdPriceForHelper() {
     try {
         const price = await fetchSolUsdPriceFromAPIForHelper();
         helperSolPriceCache.price = price;
-        helperSolPriceCache.timestamp = now;
+        helperSolPriceCache.timestamp = now; // Use 'now' from the start of function for correct TTL
         return price;
     } catch (error) {
         console.error(`${logPrefix} Failed to get fresh SOL/USD price. Details: ${error.message}`);
@@ -99,7 +149,6 @@ async function getSolUsdPriceForHelper() {
             console.warn(`${logPrefix} Using stale price due to error: $${helperSolPriceCache.price}`);
             return helperSolPriceCache.price;
         }
-        // If no stale price, this will propagate error
         throw new Error(`Unable to retrieve SOL/USD price for helper: ${error.message}`);
     } finally {
         helperSolPriceCache.isFetching = false;
@@ -199,13 +248,12 @@ async function checkAndInitiateJackpotSessions() {
             if (selectRes.rows.length === 0) {
                 await client.query('COMMIT');
                 client.release(); client = null;
-                break;
+                break; 
             }
 
             const sessionToClaim = selectRes.rows[0];
-            const sessionLogPrefixInfo = `[HelperDEJackpot_SessionInfo SID:${sessionToClaim.session_id}]`; // For info logging before claim
+            const sessionLogPrefixInfo = `[HelperDEJackpot_SessionInfo SID:${sessionToClaim.session_id}]`; 
 
-            // Attempt to update (claim) this specific session
             const updateRes = await client.query(
                 "UPDATE de_jackpot_sessions SET status = $1, helper_bot_id = $2, updated_at = NOW() WHERE session_id = $3 AND status = 'pending_pickup' RETURNING *",
                 ['active_by_helper', botUsername, sessionToClaim.session_id]
@@ -250,7 +298,7 @@ async function checkAndInitiateJackpotSessions() {
         } else if (selectRes && selectRes.rows.length === 0 && i === 0) {
             break;
         }
-        if (sessionsToAttemptToClaim > 1 && i < sessionsToAttemptToClaim -1) await sleep(250); // Slightly longer delay
+        if (sessionsToAttemptToClaim > 1 && i < sessionsToAttemptToClaim -1) await sleep(250);
     }
 }
 
@@ -276,7 +324,7 @@ async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
         jackpotPoolDisplayHTML = escapeHTML(convertLamportsToUSDStringForHelper(sessionData.jackpot_pool_at_session_start, solPrice));
     } catch (priceError) {
         console.warn(`${logPrefixSession} Could not get SOL/USD price for jackpot pool display: ${priceError.message}`);
-        const jackpotPoolSol = parseFloat(BigInt(sessionData.jackpot_pool_at_session_start) / BigInt(LAMPORTS_PER_SOL)).toFixed(2);
+        const jackpotPoolSol = parseFloat(Number(BigInt(sessionData.jackpot_pool_at_session_start)) / Number(LAMPORTS_PER_SOL)).toFixed(2);
         jackpotPoolDisplayHTML = `~${escapeHTML(jackpotPoolSol)} SOL (USD price error)`;
     }
 
@@ -340,12 +388,12 @@ bot.on('message', async (msg) => {
 
     sessionDataRef.jackpot_run_rolls.push(diceValue);
     sessionDataRef.jackpot_run_score += diceValue;
-    sessionDataRef.current_total_score = parseInt(sessionDataRef.initial_score, 10) + sessionDataRef.jackpot_run_score; // Ensure initial_score is number
+    sessionDataRef.current_total_score = parseInt(sessionDataRef.initial_score, 10) + sessionDataRef.jackpot_run_score;
 
-    if (diceValue === parseInt(sessionDataRef.bust_on_value, 10)) { // Ensure bust_on_value is number
+    if (diceValue === parseInt(sessionDataRef.bust_on_value, 10)) {
         console.log(`${logPrefixSession} Player BUSTED with roll ${diceValue}. Total score: ${sessionDataRef.current_total_score}`);
         await finalizeJackpotSession(activeSessionId, 'completed_bust', sessionDataRef.current_total_score, sessionDataRef.jackpot_run_rolls, `Busted on a ${diceValue} during jackpot run!`);
-    } else if (sessionDataRef.current_total_score >= parseInt(sessionDataRef.target_jackpot_score, 10)) { // Ensure target_jackpot_score is number
+    } else if (sessionDataRef.current_total_score >= parseInt(sessionDataRef.target_jackpot_score, 10)) {
         console.log(`${logPrefixSession} Player reached/exceeded jackpot target! Score: ${sessionDataRef.current_total_score}`);
         await finalizeJackpotSession(activeSessionId, 'completed_target_reached', sessionDataRef.current_total_score, sessionDataRef.jackpot_run_rolls, `Target ${sessionDataRef.target_jackpot_score}+ reached with score ${sessionDataRef.current_total_score}!`);
     } else {
@@ -365,11 +413,11 @@ async function handleJackpotRunTurnTimeout(sessionId) {
 }
 
 async function finalizeJackpotSession(sessionId, finalStatus, finalOverallScore, jackpotRunRollsArray, outcomeNotesStr) {
-    const sessionData = activeHelperSessions.get(sessionId);
+    const sessionData = activeHelperSessions.get(sessionId); // Get a fresh copy or the existing one
     const logPrefixSession = `[HelperDEJackpot_Finalize SID:${sessionId}]`;
 
     if (sessionData && sessionData.turnTimeoutId) clearTimeout(sessionData.turnTimeoutId);
-    activeHelperSessions.delete(sessionId);
+    activeHelperSessions.delete(sessionId); // Remove from active map
 
     console.log(`${logPrefixSession} Finalizing with status: ${finalStatus}, Score: ${finalOverallScore}, Outcome: ${outcomeNotesStr}`);
 
@@ -415,13 +463,13 @@ async function finalizeJackpotSession(sessionId, finalStatus, finalOverallScore,
         );
         if (updateResult.rowCount > 0) {
             console.log(`${logPrefixSession} DB record updated to ${finalStatus}. Main Bot will pick this up.`);
-            if (sessionData && sessionData.chat_id) {
+            if (sessionData && sessionData.chat_id) { // Ensure sessionData (and thus chat_id) is available
                 bot.sendMessage(sessionData.chat_id, finalHelperMessage, { parse_mode: 'HTML' }).catch(e => console.error(`${logPrefixSession} Error sending final helper message: ${e.message}`));
             } else {
-                console.warn(`${logPrefixSession} Could not send final helper message because sessionData or chat_id was missing for session ${sessionId}.`);
+                console.warn(`${logPrefixSession} Could not send final helper message because sessionData or chat_id was missing for session ${sessionId}. This can happen if finalization occurs without full session context (e.g. error during init).`);
             }
         } else {
-            console.warn(`${logPrefixSession} Did not update DB record for session ${sessionId}. Status might have been changed by another process or record not found for this helper. Current DB status might persist if not 'active_by_helper' or helper_bot_id mismatch.`);
+            console.warn(`${logPrefixSession} Did not update DB record for session ${sessionId}. Status might have been changed by another process or record not found for this helper.`);
         }
     } catch (dbError) {
         console.error(`${logPrefixSession} Error updating de_jackpot_sessions table to final status: ${dbError.message}`);
@@ -433,7 +481,7 @@ async function finalizeJackpotSession(sessionId, finalStatus, finalOverallScore,
 // --- Telegram Bot Event Handlers ---
 bot.onText(/\/start|\/help/i, async (msg) => {
     const chatId = msg.chat.id;
-    let currentBotUsername = botUsername; // Use already fetched/defaulted username
+    let currentBotUsername = botUsername; 
     const helpText = `I am @${currentBotUsername}, a dedicated helper bot for Dice Escalator Jackpot Runs for the main casino bot (@${escapeHTML(MAIN_BOT_USERNAME_FOR_HELPER)}).\n` +
                      `I take over once you enter jackpot mode and manage your rolls for the big prize!\n` +
                      `You typically don't need to interact with me directly via commands.`;
@@ -448,7 +496,7 @@ let dbPollingIntervalId = null;
 let isShuttingDownHelper = false;
 
 async function startHelperBot() {
-    console.log(`\n🚀🚀🚀 Initializing HelperDEJackpot Bot (v2 Price Logic) 🚀🚀🚀`);
+    console.log(`\n🚀🚀🚀 Initializing HelperDEJackpot Bot (v2 Price Logic with Retries) 🚀🚀🚀`);
     console.log(`Timestamp: ${new Date().toISOString()}`);
     try {
         const dbClient = await pool.connect();
@@ -456,7 +504,6 @@ async function startHelperBot() {
         await dbClient.query('SELECT NOW()');
         dbClient.release();
 
-        // Attempt to fetch SOL price once at startup to populate cache or identify issues early
         try {
             const initialPrice = await getSolUsdPriceForHelper();
             console.log(`HelperDEJackpot: ✅ Initial SOL/USD Price fetched: $${initialPrice.toFixed(2)}`);
@@ -495,16 +542,16 @@ async function shutdownHelper(signal) {
     });
     console.log("HelperDEJackpot: Cleared active session timeouts.");
 
-    if (bot && typeof bot.stopPolling === 'function') { // Check if stopPolling exists (it does for polling:true)
+    if (bot && typeof bot.stopPolling === 'function') {
         try {
-            if (bot.isPolling()) { // Check if actually polling
-                 await bot.stopPolling({ cancel: true }); console.log("HelperDEJackpot: Telegram polling stopped.");
+            if (bot.isPolling()) { 
+                await bot.stopPolling({ cancel: true }); console.log("HelperDEJackpot: Telegram polling stopped.");
             } else {
-                 console.log("HelperDEJackpot: Telegram bot was not polling.");
+                console.log("HelperDEJackpot: Telegram bot was not polling.");
             }
         }
         catch(e) { console.error("HelperDEJackpot: Error stopping Telegram polling:", e.message); }
-    } else if (bot && typeof bot.close === 'function') {
+    } else if (bot && typeof bot.close === 'function') { // Fallback, less ideal for polling bots
         try { await bot.close(); console.log("HelperDEJackpot: Telegram bot connection closed (via close method)."); }
         catch(e) { console.error("HelperDEJackpot: Error closing Telegram bot connection:", e.message); }
     }
@@ -522,17 +569,17 @@ process.on('SIGTERM', async () => await shutdownHelper('SIGTERM'));
 process.on('uncaughtException', (error, origin) => {
     console.error(`\n🚨🚨 HelperDEJackpot UNCAUGHT EXCEPTION AT: ${origin} 🚨🚨`, error);
     if (!isShuttingDownHelper) {
-      shutdownHelper('uncaughtException_exit').catch(() => process.exit(1)); // Attempt graceful, then force
-      setTimeout(() => process.exit(1), 5000); // Force exit after timeout
-    } else { process.exit(1); } // Already shutting down, force exit
+      shutdownHelper('uncaughtException_exit').catch(() => process.exit(1)); 
+      setTimeout(() => process.exit(1), 5000); 
+    } else { process.exit(1); } 
 });
 process.on('unhandledRejection', (reason, promise) => {
     console.error(`\n🔥🔥 HelperDEJackpot UNHANDLED REJECTION 🔥🔥 At Promise:`, promise, `Reason:`, reason);
-    // Optionally, you might want to treat critical unhandled rejections as reasons to shut down
+    // Consider if critical unhandled rejections should also trigger shutdown
     // if (!isShuttingDownHelper) {
-    //  console.log("HelperDEJackpot: Initiating shutdown due to unhandled promise rejection.");
-    //  shutdownHelper('unhandledRejection_exit').catch(() => process.exit(1));
-    //  setTimeout(() => process.exit(1), 5000);
+    //   console.log("HelperDEJackpot: Initiating shutdown due to unhandled promise rejection.");
+    //   shutdownHelper('unhandledRejection_exit').catch(() => process.exit(1));
+    //   setTimeout(() => process.exit(1), 5000);
     // }
 });
 
