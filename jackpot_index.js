@@ -281,8 +281,9 @@ async function checkAndInitiateJackpotSessions() {
 
         if (claimedSessionData) {
             console.log(`${logPrefixCycle} SID:${claimedSessionData.session_id} Storing locally and sending initial prompt.`);
+            // Ensure claimedSessionData includes user_id and user_first_name from DB
             activeHelperSessions.set(claimedSessionData.session_id, {
-                ...claimedSessionData,
+                ...claimedSessionData, // This should include user_id, user_first_name, etc. from the DB
                 jackpot_run_rolls: [],
                 jackpot_run_score: 0,
                 current_total_score: parseInt(claimedSessionData.initial_score, 10),
@@ -315,6 +316,14 @@ async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
         sessionData.turnTimeoutId = null;
     }
 
+    // --- Create user mention ---
+    // Assumes sessionData.user_id is the Telegram user ID from the database.
+    // Assumes sessionData.user_first_name contains the user's first name from the database.
+    const userIdForMention = sessionData.user_id; 
+    const userDisplayName = escapeHTML(sessionData.user_first_name || "Player"); // Fallback to "Player"
+    const userMentionHTML = `<a href="tg://user?id=${userIdForMention}">${userDisplayName}</a>`;
+    // --- End of user mention ---
+
     const initialRollsDisplay = formatDiceRollsHTML(sessionData.initial_rolls_parsed);
     const jackpotRunRollsDisplay = formatDiceRollsHTML(sessionData.jackpot_run_rolls);
 
@@ -328,7 +337,7 @@ async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
         jackpotPoolDisplayHTML = `~${escapeHTML(jackpotPoolSol)} SOL (USD price error)`;
     }
 
-    let message = `🏆 <b>Jackpot Run!</b> (Dice by @${escapeHTML(botUsername)})\n\n` +
+    let message = `${userMentionHTML}, it's your 🏆 <b>Jackpot Run!</b> (Dice by @${escapeHTML(botUsername)})\n\n` +
                   `Your score entering this run: <b>${sessionData.initial_score}</b>\n` +
                   `Rolls during this Jackpot Run: ${jackpotRunRollsDisplay}\n` +
                   `🔥 Combined Total Score: <b>${sessionData.current_total_score}</b>\n` +
@@ -360,7 +369,7 @@ async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
 bot.on('message', async (msg) => {
     if (isShuttingDownHelper || !msg.dice || !msg.from || msg.from.is_bot) return;
 
-    const userId = String(msg.from.id);
+    const userId = String(msg.from.id); // This is the user_id from Telegram message
     const chatId = String(msg.chat.id);
     const diceValue = msg.dice.value;
 
@@ -368,6 +377,7 @@ bot.on('message', async (msg) => {
     let sessionDataRef = null;
 
     for (const [sId, sData] of activeHelperSessions.entries()) {
+        // Ensure sData.user_id (from DB) matches msg.from.id (from Telegram)
         if (String(sData.user_id) === userId && String(sData.chat_id) === chatId && sData.status === 'active_by_helper') {
             activeSessionId = sId;
             sessionDataRef = sData;
@@ -377,8 +387,15 @@ bot.on('message', async (msg) => {
 
     if (!activeSessionId || !sessionDataRef) return;
 
+    // Optionally, update user_first_name in sessionDataRef if it wasn't available from DB initially
+    // This would only benefit messages sent *after* this first roll.
+    // if (!sessionDataRef.user_first_name && msg.from.first_name) {
+    //    sessionDataRef.user_first_name = msg.from.first_name;
+    // }
+
+
     const logPrefixSession = `[HelperDEJackpot_Roll SID:${activeSessionId}]`;
-    console.log(`${logPrefixSession} User ${userId} rolled ${diceValue} in jackpot run.`);
+    console.log(`${logPrefixSession} User ${userId} (Name: ${sessionDataRef.user_first_name || msg.from.first_name || 'N/A'}) rolled ${diceValue} in jackpot run.`);
     bot.deleteMessage(chatId, msg.message_id).catch(() => {});
 
     if (sessionDataRef.turnTimeoutId) {
@@ -407,19 +424,26 @@ async function handleJackpotRunTurnTimeout(sessionId) {
     if (!sessionData || sessionData.status !== 'active_by_helper') return;
 
     const logPrefixSession = `[HelperDEJackpot_Timeout SID:${sessionId}]`;
-    console.log(`${logPrefixSession} User ${sessionData.user_id} timed out during jackpot run.`);
+    console.log(`${logPrefixSession} User ${sessionData.user_id} (Name: ${sessionData.user_first_name || 'N/A'}) timed out during jackpot run.`);
 
     await finalizeJackpotSession(sessionId, 'completed_timeout_forfeit', sessionData.current_total_score, sessionData.jackpot_run_rolls, "Turn timed out during jackpot run.");
 }
 
 async function finalizeJackpotSession(sessionId, finalStatus, finalOverallScore, jackpotRunRollsArray, outcomeNotesStr) {
-    const sessionData = activeHelperSessions.get(sessionId); // Get a fresh copy or the existing one
+    const sessionData = activeHelperSessions.get(sessionId); 
     const logPrefixSession = `[HelperDEJackpot_Finalize SID:${sessionId}]`;
 
+    let userMentionHTML = "Player"; 
+    if (sessionData && sessionData.user_id) {
+        const userIdForMention = sessionData.user_id;
+        const userDisplayName = escapeHTML(sessionData.user_first_name || "Player");
+        userMentionHTML = `<a href="tg://user?id=${userIdForMention}">${userDisplayName}</a>`;
+    }
+    
     if (sessionData && sessionData.turnTimeoutId) clearTimeout(sessionData.turnTimeoutId);
-    activeHelperSessions.delete(sessionId); // Remove from active map
+    activeHelperSessions.delete(sessionId); 
 
-    console.log(`${logPrefixSession} Finalizing with status: ${finalStatus}, Score: ${finalOverallScore}, Outcome: ${outcomeNotesStr}`);
+    console.log(`${logPrefixSession} Finalizing with status: ${finalStatus}, Score: ${finalOverallScore}, Outcome: ${outcomeNotesStr} for user ${sessionData ? sessionData.user_id : 'UNKNOWN'}`);
 
     const initialRolls = JSON.parse(sessionData?.initial_rolls_json || '[]');
     const finalRollsCombined = JSON.stringify([...initialRolls, ...jackpotRunRollsArray]);
@@ -427,7 +451,7 @@ async function finalizeJackpotSession(sessionId, finalStatus, finalOverallScore,
     let finalHelperMessageTitle = "";
     let finalHelperMessageBody = "";
     const escapedOutcomeNotes = escapeHTML(outcomeNotesStr);
-    const scoreDisplay = `Your final score for this jackpot attempt: <b>${finalOverallScore}</b>.`;
+    const scoreDisplay = `${userMentionHTML}, your final score for this jackpot attempt: <b>${finalOverallScore}</b>.`;
 
     switch(finalStatus) {
         case 'completed_bust':
@@ -444,9 +468,9 @@ async function finalizeJackpotSession(sessionId, finalStatus, finalOverallScore,
             break;
         case 'error_sending_message':
         case 'error_helper_init_prompt':
-        default:
+        default: 
             finalHelperMessageTitle = `⚠️ Jackpot Run Update (Session ${sessionId}) ⚠️`;
-            finalHelperMessageBody = `There was an issue with your jackpot run.\nDetails: ${escapedOutcomeNotes}`;
+            finalHelperMessageBody = `${userMentionHTML}, there was an issue with your jackpot run.\nDetails: ${escapedOutcomeNotes}\nYour score at the point of issue was: <b>${finalOverallScore}</b>.`;
             break;
     }
 
@@ -463,13 +487,14 @@ async function finalizeJackpotSession(sessionId, finalStatus, finalOverallScore,
         );
         if (updateResult.rowCount > 0) {
             console.log(`${logPrefixSession} DB record updated to ${finalStatus}. Main Bot will pick this up.`);
-            if (sessionData && sessionData.chat_id) { // Ensure sessionData (and thus chat_id) is available
-                bot.sendMessage(sessionData.chat_id, finalHelperMessage, { parse_mode: 'HTML' }).catch(e => console.error(`${logPrefixSession} Error sending final helper message: ${e.message}`));
+            const chatIdToSendTo = sessionData ? sessionData.chat_id : null;
+            if (chatIdToSendTo) { 
+                bot.sendMessage(chatIdToSendTo, finalHelperMessage, { parse_mode: 'HTML' }).catch(e => console.error(`${logPrefixSession} Error sending final helper message: ${e.message}`));
             } else {
-                console.warn(`${logPrefixSession} Could not send final helper message because sessionData or chat_id was missing for session ${sessionId}. This can happen if finalization occurs without full session context (e.g. error during init).`);
+                console.warn(`${logPrefixSession} Could not send final helper message because chat_id was missing for session ${sessionId}.`);
             }
         } else {
-            console.warn(`${logPrefixSession} Did not update DB record for session ${sessionId}. Status might have been changed by another process or record not found for this helper.`);
+            console.warn(`${logPrefixSession} Did not update DB record for session ${sessionId}. Status might have been changed by another process or record not found for this helper (Helper ID: ${botUsername}).`);
         }
     } catch (dbError) {
         console.error(`${logPrefixSession} Error updating de_jackpot_sessions table to final status: ${dbError.message}`);
@@ -496,7 +521,7 @@ let dbPollingIntervalId = null;
 let isShuttingDownHelper = false;
 
 async function startHelperBot() {
-    console.log(`\n🚀🚀🚀 Initializing HelperDEJackpot Bot (v2 Price Logic with Retries) 🚀🚀🚀`);
+    console.log(`\n🚀🚀🚀 Initializing HelperDEJackpot Bot (v2 Price Logic with Retries & User Mentions) 🚀🚀🚀`);
     console.log(`Timestamp: ${new Date().toISOString()}`);
     try {
         const dbClient = await pool.connect();
@@ -551,7 +576,7 @@ async function shutdownHelper(signal) {
             }
         }
         catch(e) { console.error("HelperDEJackpot: Error stopping Telegram polling:", e.message); }
-    } else if (bot && typeof bot.close === 'function') { // Fallback, less ideal for polling bots
+    } else if (bot && typeof bot.close === 'function') { 
         try { await bot.close(); console.log("HelperDEJackpot: Telegram bot connection closed (via close method)."); }
         catch(e) { console.error("HelperDEJackpot: Error closing Telegram bot connection:", e.message); }
     }
@@ -575,12 +600,6 @@ process.on('uncaughtException', (error, origin) => {
 });
 process.on('unhandledRejection', (reason, promise) => {
     console.error(`\n🔥🔥 HelperDEJackpot UNHANDLED REJECTION 🔥🔥 At Promise:`, promise, `Reason:`, reason);
-    // Consider if critical unhandled rejections should also trigger shutdown
-    // if (!isShuttingDownHelper) {
-    //   console.log("HelperDEJackpot: Initiating shutdown due to unhandled promise rejection.");
-    //   shutdownHelper('unhandledRejection_exit').catch(() => process.exit(1));
-    //   setTimeout(() => process.exit(1), 5000);
-    // }
 });
 
 // --- Start the Bot ---
