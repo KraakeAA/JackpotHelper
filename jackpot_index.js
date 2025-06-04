@@ -61,96 +61,113 @@ function formatDiceRollsHTML(rollsArray) {
 // --- Database Polling to Pick Up New Jackpot Sessions ---
 async function checkAndInitiateJackpotSessions() {
     if (isShuttingDownHelper) return;
-    let client = null;
-    try {
-        client = await pool.connect();
-        
-        const activeSessionCount = activeHelperSessions.size;
-        if (activeSessionCount >= MAX_SESSIONS_PER_CYCLE) {
-            // console.log(`[HelperDEJackpot_Poll] Already managing ${activeSessionCount} session(s). Max per cycle: ${MAX_SESSIONS_PER_CYCLE}. Skipping new claims this cycle.`);
-            client.release();
-            return;
-        }
-        
-        await client.query('BEGIN');
 
-        const selectQuery = `
-            SELECT * FROM de_jackpot_sessions 
-            WHERE status = 'pending_pickup' 
-            ORDER BY created_at ASC 
-            LIMIT $1 
-            FOR UPDATE SKIP LOCKED`;
-        // Limit how many new sessions we pick up based on how many we are already managing
-        const limitForQuery = MAX_SESSIONS_PER_CYCLE - activeSessionCount;
-        if (limitForQuery <= 0) {
-            await client.query('COMMIT'); // Or ROLLBACK, though nothing changed
-            client.release();
-            return;
-        }
+    const activeSessionCount = activeHelperSessions.size;
+    const maxConcurrentSessionsThisHelper = MAX_SESSIONS_PER_CYCLE; // How many this instance is willing to manage
 
-        const result = await client.query(selectQuery, [limitForQuery]);
-
-        if (result.rows.length === 0) {
-            await client.query('COMMIT');
-            client.release();
-            return;
-        }
-
-        console.log(`[HelperDEJackpot_Poll] Found ${result.rows.length} pending jackpot session(s) to claim.`);
-
-        for (const session of result.rows) {
-            if (isShuttingDownHelper) {
-                console.log(`[HelperDEJackpot_Session SID:${session.session_id}] Shutdown initiated, skipping claim.`);
-                break; 
-            }
-            const logPrefixSession = `[HelperDEJackpot_Session SID:${session.session_id} GID:${session.main_bot_game_id}]`;
-            console.log(`${logPrefixSession} Attempting to claim session for UserID: ${session.user_id}`);
-
-            try {
-                const updateRes = await client.query(
-                    "UPDATE de_jackpot_sessions SET status = $1, helper_bot_id = $2, updated_at = NOW() WHERE session_id = $3 AND status = 'pending_pickup' RETURNING *",
-                    ['active_by_helper', botUsername, session.session_id]
-                );
-
-                if (updateRes.rowCount > 0) {
-                    const activeSessionData = updateRes.rows[0];
-                    // Commit this specific claim before proceeding with long-running game logic for this session
-                    // This specific COMMIT is for the UPDATE above. The outer BEGIN/COMMIT handles the SELECT FOR UPDATE.
-                    // Simpler: Let outer BEGIN/COMMIT handle it. If processActiveSession errors, outer rollback occurs.
-                    // await client.query('COMMIT'); 
-
-                    console.log(`${logPrefixSession} Session claimed and set to 'active_by_helper'. Storing locally.`);
-                    activeHelperSessions.set(activeSessionData.session_id, {
-                        ...activeSessionData, // All fields from DB
-                        jackpot_run_rolls: [], 
-                        jackpot_run_score: 0,  
-                        current_total_score: parseInt(activeSessionData.initial_score, 10), 
-                        turnTimeoutId: null,
-                        initial_rolls_parsed: JSON.parse(activeSessionData.initial_rolls_json || '[]') // Pre-parse for convenience
-                    });
-                    
-                    await sendJackpotRunUpdate(activeSessionData.session_id); // Send initial prompt & set timeout
-                } else {
-                    console.warn(`${logPrefixSession} Could not claim session (already picked up or status changed).`);
-                    // No need to rollback here if claim failed, means another helper got it or state changed.
-                }
-            } catch (claimError) {
-                console.error(`${logPrefixSession} Error claiming or initiating session: ${claimError.message}`);
-                // Don't rollback here as it might affect other claims in a batched loop.
-                // The FOR UPDATE SKIP LOCKED should handle concurrency.
-                // If a specific claim attempt fails, we log and move on. The outer transaction will eventually commit or rollback.
-            }
-        }
-        await client.query('COMMIT'); // Commit all successful claims or changes from the loop
-    } catch (error) {
-        console.error('[HelperDEJackpot_Poll] Error during DB check/processing cycle:', error);
-        if (client) {
-            try { await client.query('ROLLBACK'); }
-            catch (rollbackError) { console.error('[HelperDEJackpot_Poll] Failed to rollback:', rollbackError); }
-        }
-    } finally {
-        if (client) client.release();
+    if (activeSessionCount >= maxConcurrentSessionsThisHelper) {
+        // console.log(`[HelperDEJackpot_Poll] Already managing ${activeSessionCount} session(s). Max: ${maxConcurrentSessionsThisHelper}. Skipping new claims.`);
+        return;
     }
+
+    const sessionsToAttemptToClaim = maxConcurrentSessionsThisHelper - activeSessionCount;
+    if (sessionsToAttemptToClaim <= 0) {
+        return;
+    }
+
+    // Attempt to claim one session at a time, up to the limit we can handle
+    for (let i = 0; i < sessionsToAttemptToClaim; i++) {
+        if (isShuttingDownHelper) {
+            console.log("[HelperDEJackpot_Poll] Shutdown detected during claim loop.");
+            break;
+        }
+
+        let client = null;
+        let claimedSessionData = null;
+        const logPrefixCycle = `[HelperDEJackpot_PollAttempt ${i+1}/${sessionsToAttemptToClaim}]`;
+
+        try {
+            client = await pool.connect(); // Acquire a client for this attempt
+            await client.query('BEGIN');
+
+            // Select and lock ONE available session for this specific helper type
+            const selectRes = await client.query(
+                `SELECT * FROM de_jackpot_sessions 
+                 WHERE status = 'pending_pickup' 
+                 ORDER BY created_at ASC 
+                 LIMIT 1 
+                 FOR UPDATE SKIP LOCKED`
+            );
+
+            if (selectRes.rows.length === 0) {
+                // No more pending tasks for this helper type found in this attempt
+                await client.query('COMMIT'); // or ROLLBACK, as nothing changed
+                client.release(); client = null; // Release this client
+                // console.log(`${logPrefixCycle} No pending jackpot sessions found to claim.`);
+                break; // Exit the loop for this polling cycle
+            }
+
+            const sessionToClaim = selectRes.rows[0];
+            const sessionLogPrefix = `[HelperDEJackpot_Session SID:${sessionToClaim.session_id}]`;
+
+            // Attempt to update (claim) this specific session
+            const updateRes = await client.query(
+                "UPDATE de_jackpot_sessions SET status = $1, helper_bot_id = $2, updated_at = NOW() WHERE session_id = $3 AND status = 'pending_pickup' RETURNING *",
+                ['active_by_helper', botUsername, sessionToClaim.session_id]
+            );
+
+            if (updateRes.rowCount > 0) {
+                await client.query('COMMIT'); // Commit the successful claim
+                console.log(`${sessionLogPrefix} Session claimed by ${botUsername}.`);
+                claimedSessionData = updateRes.rows[0];
+            } else {
+                // This means another helper instance claimed it between the SELECT FOR UPDATE and this UPDATE.
+                // This can happen if SKIP LOCKED wasn't fully effective or if there's a slight race.
+                // Or if status wasn't 'pending_pickup' anymore.
+                console.warn(`${sessionLogPrefix} Failed to claim (session ${sessionToClaim.session_id} likely picked by another instance or status changed).`);
+                await client.query('ROLLBACK'); // Rollback this attempt
+            }
+        } catch (dbError) {
+            console.error(`${logPrefixCycle} DB Error during claim attempt: ${dbError.message}`, dbError.stack?.substring(0, 300));
+            if (client) {
+                try { await client.query('ROLLBACK'); } 
+                catch (rbErr) { console.error(`${logPrefixCycle} Claim attempt rollback error: ${rbErr.message}`); }
+            }
+        } finally {
+            if (client) {
+                client.release(); // Ensure client is always released for this attempt
+            }
+        }
+
+        if (claimedSessionData) {
+            // Process the claimed session (this part is outside the DB transaction for claiming)
+            console.log(`${logPrefixCycle} SID:${claimedSessionData.session_id} Storing locally and sending initial prompt.`);
+            activeHelperSessions.set(claimedSessionData.session_id, {
+                ...claimedSessionData,
+                jackpot_run_rolls: [], 
+                jackpot_run_score: 0,  
+                current_total_score: parseInt(claimedSessionData.initial_score, 10), 
+                turnTimeoutId: null,
+                initial_rolls_parsed: JSON.parse(claimedSessionData.initial_rolls_json || '[]') // Pre-parse for convenience
+            });
+            // This sendJackpotRunUpdate is async. We don't await it here to allow the loop 
+            // to potentially pick up more sessions if MAX_SESSIONS_PER_CYCLE > 1 for this helper instance.
+            // Error handling within sendJackpotRunUpdate should be robust.
+            sendJackpotRunUpdate(claimedSessionData.session_id).catch(sendErr => {
+                console.error(`Error in initial sendJackpotRunUpdate for SID ${claimedSessionData.session_id}: ${sendErr.message}`);
+                // If the very first message fails, we should update the session status to error
+                // so it doesn't get stuck in 'active_by_helper'.
+                finalizeJackpotSession(claimedSessionData.session_id, 'error_helper_init_prompt', 
+                                       parseInt(claimedSessionData.initial_score, 10), [], 
+                                       `Failed initial prompt: ${sendErr.message.substring(0,100)}`);
+            });
+        } else if (selectRes && selectRes.rows.length === 0 && i === 0) {
+            // If the very first attempt to select a session found nothing, no need to loop further in this polling cycle.
+            break;
+        }
+        // Small delay if processing multiple to be slightly less aggressive on DB connections
+        if (sessionsToAttemptToClaim > 1 && i < sessionsToAttemptToClaim -1) await sleep(100); 
+    } // End of for loop
 }
 
 async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
