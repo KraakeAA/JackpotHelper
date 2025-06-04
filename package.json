@@ -1,24 +1,14 @@
 {
   "name": "jackpot-helper-bot",
   "version": "1.0.0",
-  "description": "Dedicated helper bot for Dice Escalator Jackpot Runs.",
   "main": "jackpot_index.js",
   "type": "module",
   "scripts": {
-    "start": "node jackpot_index.js",
-    "dev": "nodemon jackpot_index.js"
+    "start": "node jackpot_index.js"
   },
   "dependencies": {
-    "dotenv": "^16.3.1",             // Or your preferred version
-    "node-telegram-bot-api": "^0.64.0", // Or your preferred version
-    "pg": "^8.11.3"                    // Or your preferred version
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"              // Optional, for development
-  },
-  "engines": {
-    "node": ">=16.0.0"
-  },
-  "author": "Your Project",
-  "license": "ISC"
+    "dotenv": "^16.3.1",
+    "node-telegram-bot-api": "^0.64.0",
+    "pg": "^8.11.3"
+  }
 }
