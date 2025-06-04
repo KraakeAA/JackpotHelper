@@ -155,10 +155,7 @@ async function checkAndInitiateJackpotSessions() {
 
 async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
     const sessionData = activeHelperSessions.get(sessionId);
-    if (!sessionData) {
-        console.warn(`[HelperDEJackpot_Update SID:${sessionId}] No active session found to update message.`);
-        return;
-    }
+    if (!sessionData) { /* ... */ return; }
     const logPrefixSession = `[HelperDEJackpot_Update SID:${sessionId}]`;
 
     if (sessionData.turnTimeoutId) {
@@ -170,14 +167,13 @@ async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
     const jackpotRunRollsDisplay = formatDiceRollsHTML(sessionData.jackpot_run_rolls);
     const jackpotPoolSol = parseFloat(BigInt(sessionData.jackpot_pool_at_session_start) / BigInt(10**9)).toFixed(2);
 
-
+    // --- MODIFIED MESSAGE STRUCTURE FOR CLARITY ---
     let message = `🏆 <b>Jackpot Run!</b> (Dice by @${escapeHTML(botUsername)})\n\n` +
-                  `Your score (before this run): <b>${sessionData.initial_score}</b> (Rolls: ${initialRollsDisplay})\n` +
-                  `Jackpot Run Rolls: ${jackpotRunRollsDisplay}\n` +
-                  `Jackpot Run Score: <b>${sessionData.jackpot_run_score}</b>\n` +
-                  `🔥 Current Total Score: <b>${sessionData.current_total_score}</b>\n` +
-                  `🎯 Target: <b>${sessionData.target_jackpot_score}+</b> (Bust on ${sessionData.bust_on_value})\n` +
-                  `💰 Jackpot (this attempt): approx. <b>${escapeHTML(jackpotPoolSol)} SOL</b>\n\n`;
+                  `Your score entering this run: <b>${sessionData.initial_score}</b>\n` +
+                  `Rolls during this Jackpot Run: ${jackpotRunRollsDisplay}\n` +
+                  `🔥 Combined Total Score: <b>${sessionData.current_total_score}</b>\n` + // Emphasize this
+                  `🎯 Target for Jackpot: <b>${sessionData.target_jackpot_score}+</b> (Bust on ${sessionData.bust_on_value})\n` +
+                  `💰 Jackpot Pool (this attempt): approx. <b>${escapeHTML(jackpotPoolSol)} SOL</b>\n\n`;
 
     if (lastRollValue !== null) {
         message += `You just rolled: 🎲<b>${lastRollValue}</b>!\n\n`;
@@ -192,10 +188,11 @@ async function sendJackpotRunUpdate(sessionId, lastRollValue = null) {
     } else { 
         message += `<b>${escapeHTML(sessionData.outcome_notes || "Jackpot run segment ended.")}</b>\nReporting result to Main Bot...`;
     }
+    // --- END OF MODIFIED MESSAGE STRUCTURE ---
 
     bot.sendMessage(sessionData.chat_id, message, { parse_mode: 'HTML' }).catch(err => {
         console.error(`${logPrefixSession} Error sending jackpot run update message: ${err.message}`);
-        if (err.response && (err.response.body.error_code === 403 || err.response.body.error_code === 400)) { // Bot blocked or bad request
+        if (err.response && (err.response.body.error_code === 403 || err.response.body.error_code === 400)) {
             finalizeJackpotSession(sessionId, 'error_sending_message', sessionData.current_total_score, sessionData.jackpot_run_rolls, `Helper failed to send message to chat: ${err.message.substring(0,100)}`);
         }
     });
